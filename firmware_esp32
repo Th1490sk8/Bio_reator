@@ -1,0 +1,121 @@
+#include <WiFi.h>
+#include <DHT.h>
+#include <Adafruit_ADS1X15.h>
+
+// ================= CONFIGURAÇÕES =================
+const char* WIFI_SSID = "3M_2Ghz";
+const char* WIFI_PASSWORD = "20191425";
+
+#define DHT_PIN 23
+#define DHT_TYPE DHT11
+
+// Pinos dos relés
+#define RELE_VENTOINHA 33   // IN2
+#define RELE_BOMBA     32   // IN1
+
+// Temperatura limite
+#define TEMP_LIMITE 25.0
+
+// Calibração do sensor de umidade do solo (YL-69 via ADS1115)
+const int VALOR_BRUTO_SECO = 32000;     // Solo completamente seco
+const int VALOR_BRUTO_MOLHADO = 4000;   // Solo completamente úmido
+
+// ================= OBJETOS GLOBAIS =================
+Adafruit_ADS1115 ads;
+DHT dht(DHT_PIN, DHT_TYPE);
+WiFiServer server(80);
+
+// ================= FUNÇÕES AUXILIARES =================
+float calcularUmidadeSolo(int16_t leitura) {
+  float umidade = map(leitura, VALOR_BRUTO_SECO, VALOR_BRUTO_MOLHADO, 0, 100);
+  return constrain(umidade, 0, 100);
+}
+
+void iniciarWiFi() {
+  Serial.print("Conectando-se ao Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("Wi-Fi conectado!");
+  Serial.print("Endereço IP: ");
+  Serial.println(WiFi.localIP());
+  server.begin();
+}
+
+void enviarJSON(WiFiClient& client, float temperatura, float umidadeAr, float umidadeSolo) {
+  String json = "{";
+  json += "\"temperature\":" + String(temperatura, 2) + ",";
+  json += "\"humidity_air\":" + String(umidadeAr, 2) + ",";
+  json += "\"humidity_soil\":" + String(umidadeSolo, 2);
+  json += "}";
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+  client.print(json);
+}
+
+void enviarHTML(WiFiClient& client) {
+  String html = R"=====(<!DOCTYPE html><html lang='pt-br'><head><meta charset='UTF-8'><title>Estação Meteorológica</title><meta name='viewport' content='width=device-width, initial-scale=1'><script src='https://cdn.jsdelivr.net/npm/chart.js'></script><style>body{font-family:'Segoe UI',sans-serif;background:#f4f6f8;color:#333;margin:0;padding:20px;text-align:center;}h1{color:#2c3e50;}canvas{margin:20px auto;width:220px;height:220px;display:block;}footer{font-size:12px;color:#888;margin-top:30px;}</style></head><body><h1>Estação Meteorológica Local</h1><p>Dados em tempo real - ESP32 + DHT11 + YL-69</p><canvas id='dhtChart'></canvas><footer>Última atualização: <span id='hora'></span></footer><script>const ctx=document.getElementById('dhtChart').getContext('2d');const dhtChart=new Chart(ctx,{type:'doughnut',data:{labels:['Umidade Ar (%)','Umidade Solo (%)','Temperatura (°C)'],datasets:[{data:[0,0,0],backgroundColor:['#3498db','#8e44ad','#e67e22'],borderWidth:1}]},options:{plugins:{legend:{position:'bottom'},title:{display:true,text:'Sensores DHT11 + YL-69'},tooltip:{callbacks:{label:c=>c.label+': '+c.formattedValue}}},responsive:true}});function atualizar(){fetch('/data').then(r=>r.json()).then(d=>{dhtChart.data.datasets[0].data=[d.humidity_air,d.humidity_soil,d.temperature];dhtChart.update();});document.getElementById('hora').textContent=new Date().toLocaleTimeString();}setInterval(atualizar,3000);</script></body></html>)=====";
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+  client.print(html);
+}
+
+// ================= CONFIGURAÇÃO INICIAL =================
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+
+  if (!ads.begin()) {
+    Serial.println("ERRO: ADS1115 não encontrado! Verifique conexões SDA/SCL.");
+    while (true);
+  }
+
+  ads.setGain(GAIN_ONE);
+  iniciarWiFi();
+
+  // Configura os pinos dos relés como saída
+  pinMode(RELE_VENTOINHA, OUTPUT);
+  pinMode(RELE_BOMBA, OUTPUT);
+
+  // Desliga tudo no início (relés em HIGH normalmente desligam)
+  digitalWrite(RELE_VENTOINHA, HIGH);
+  digitalWrite(RELE_BOMBA, HIGH);
+}
+
+// ================= LOOP PRINCIPAL =================
+void loop() {
+  WiFiClient client = server.available();
+
+  int16_t leituraSolo = ads.readADC_SingleEnded(0);
+  float umidadeSolo = calcularUmidadeSolo(leituraSolo);
+  float umidadeAr = dht.readHumidity();
+  float temperatura = dht.readTemperature();
+
+  // Controle da ventoinha
+  if (temperatura >= TEMP_LIMITE) {
+    digitalWrite(RELE_VENTOINHA, LOW);   // Liga ventoinha
+  } else {
+    digitalWrite(RELE_VENTOINHA, HIGH);  // Desliga ventoinha
+  }
+
+  // (Aqui futuramente você pode adicionar lógica para a bomba no RELE_BOMBA)
+
+  if (client) {
+    String req = client.readStringUntil('\r');
+    if (req.indexOf("/data") >= 0) {
+      enviarJSON(client, temperatura, umidadeAr, umidadeSolo);
+    } else {
+      enviarHTML(client);
+    }
+    client.stop();
+  }
+}
